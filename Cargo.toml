@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libp2p = { version = "0.54", features = ["tcp", "tls", "dns", "tokio", "noise", "yamux", "websocket", "ping", "macros"] }
+libp2p = { version = "0.53", features = [ "tokio", "gossipsub", "mdns", "noise", "macros", "tcp", "yamux", "quic"] }
 futures = "0.3"
 tokio = { version = "1.42", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -12,3 +12,5 @@ chrono = "0.4.38"
 rand = "0.8.5"
 blake3 = { version = "1.5.5", features = ["digest", "rayon"] }
 tracing = { version = "0.1.41", features = ["log"] }
+thiserror = "2.0.4"
+arrayvec = "0.7.6"
