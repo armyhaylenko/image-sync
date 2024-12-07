@@ -4,15 +4,9 @@ use blake3::{Hash, Hasher};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use tokio::sync::{Mutex, RwLock};
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Date not found: {0}")]
-    BadDate(NaiveDate),
-    #[error("Something went wrong...")]
-    InternalError,
-}
+use crate::error::Error;
 
-const AVAILABLE_DATES: [NaiveDate; 30] = [
+pub const AVAILABLE_DATES: [NaiveDate; 30] = [
     NaiveDate::from_ymd_opt(2024, 12, 1).unwrap(),
     NaiveDate::from_ymd_opt(2024, 12, 2).unwrap(),
     NaiveDate::from_ymd_opt(2024, 12, 3).unwrap(),
@@ -53,16 +47,6 @@ const AVAILABLE_TIMES: [NaiveTime; 6] = [
     NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
     NaiveTime::from_hms_opt(20, 0, 0).unwrap(),
 ];
-
-fn gen_date_distribution() -> Vec<NaiveDate> {
-    use rand::seq::SliceRandom;
-    let mut dates: Vec<NaiveDate> = AVAILABLE_DATES
-        .choose_multiple(&mut rand::thread_rng(), 20)
-        .cloned()
-        .collect();
-    dates.sort();
-    dates
-}
 
 fn gen_image_times(date: NaiveDate) -> Vec<NaiveDateTime> {
     use rand::seq::SliceRandom;
@@ -137,19 +121,18 @@ impl Directory {
 pub struct NaiveFs {
     /// Root hash of the filesystem. Once all the root hashes
     /// of the peers become equal, we know the sync is finished.
-    root_hash: Arc<RwLock<Hash>>,
+    pub root_hash: Arc<RwLock<Hash>>,
     /// Assuming that we only have directories in the fs
     /// The obv choice for such task is an MPT, but i want to rely
     /// on libraries as least as possible.
     ///
     /// the RwLock is used for easy concurrent accesses
-    dir_metadatas: Arc<RwLock<HashMap<NaiveDate, DirectoryMetadata>>>,
-    dirs: Arc<Mutex<Vec<Directory>>>,
+    pub dir_metadatas: Arc<RwLock<HashMap<NaiveDate, DirectoryMetadata>>>,
+    pub dirs: Arc<Mutex<Vec<Directory>>>,
 }
 
 impl NaiveFs {
     pub fn random() -> Self {
-        let available_dates = gen_date_distribution();
         let mut root_hasher = Hasher::new();
         let gen_directory_images = |date: NaiveDate| -> Vec<(Hash, Image)> {
             gen_image_times(date)
@@ -161,7 +144,7 @@ impl NaiveFs {
                 })
                 .collect()
         };
-        let dirs: Vec<(NaiveDate, Directory, DirectoryMetadata)> = available_dates
+        let dirs: Vec<(NaiveDate, Directory, DirectoryMetadata)> = AVAILABLE_DATES
             .into_iter()
             .enumerate()
             .map(|(idx, d)| {
@@ -193,13 +176,13 @@ impl NaiveFs {
         }
     }
 
-    pub async fn dir_state(&self, date: NaiveDate) -> Result<Hash, Error> {
+    pub async fn dir_state(&self, date: &NaiveDate) -> Result<Hash, Error> {
         Ok(self
             .dir_metadatas
             .read()
             .await
-            .get(&date)
-            .ok_or(Error::BadDate(date))?
+            .get(date)
+            .ok_or(Error::BadDate(*date))?
             .dir_hash)
     }
 
@@ -230,4 +213,3 @@ impl NaiveFs {
         Ok(images)
     }
 }
-
