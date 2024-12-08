@@ -6,6 +6,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::error::Error;
 
+pub const DATE_FORMAT_DIR: &str = "%Y-%m-%d";
+pub const DATE_FORMAT_IMG: &str = "%Y-%m-%d:%h-%M-%s";
 pub const AVAILABLE_DATES: [NaiveDate; 30] = [
     NaiveDate::from_ymd_opt(2024, 12, 1).unwrap(),
     NaiveDate::from_ymd_opt(2024, 12, 2).unwrap(),
@@ -61,32 +63,33 @@ fn gen_image_times(date: NaiveDate) -> Vec<NaiveDateTime> {
 
 #[derive(Clone)]
 pub struct Image {
-    /// the image itself, for the purposes of test task is just random bytes
-    pub data: Vec<u8>,
     /// the actual date & time value we care about for ordering
     pub created_at: NaiveDateTime,
 }
 
 impl std::fmt::Debug for Image {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "|{}| {:x?}...", self.created_at, &self.data[..5])
+        write!(
+            f,
+            "|{}| {:?}...",
+            self.created_at,
+            self.hash().to_hex()
+        )
     }
 }
 
 impl Image {
-    fn random(created_at: NaiveDateTime) -> Self {
-        let rand_slice: [u8; 32] = rand::random();
-        Self {
-            created_at,
-            data: rand_slice.to_vec(),
-        }
+    fn new(created_at: NaiveDateTime) -> Self {
+        Self { created_at }
     }
 
     fn hash(&self) -> Hash {
         #[cfg(debug_assertions)]
         tracing::trace!(img_name = %self.created_at, "Hashing self");
 
-        Hasher::new().update_rayon(&self.data).finalize()
+        Hasher::new()
+            .update(&self.created_at.format("%Y-%m-%d:%h-%M-%s").to_string().as_bytes())
+            .finalize()
     }
 }
 
@@ -110,7 +113,7 @@ impl Directory {
     fn hash(&self) -> Hash {
         let mut hasher = Hasher::new();
         for (image_hash, _) in self.images.iter() {
-            hasher.update_rayon(image_hash.as_bytes());
+            hasher.update(image_hash.as_bytes());
         }
 
         hasher.finalize()
@@ -138,7 +141,7 @@ impl NaiveFs {
             gen_image_times(date)
                 .into_iter()
                 .map(|t| {
-                    let i = Image::random(t);
+                    let i = Image::new(t);
                     let hash = i.hash();
                     (hash, i)
                 })
@@ -148,12 +151,15 @@ impl NaiveFs {
             .into_iter()
             .enumerate()
             .map(|(idx, d)| {
+                let images = gen_directory_images(d);
                 let dir = Directory {
                     date: d,
-                    images: gen_directory_images(d),
+                    // TODO: remove the clone
+                    images: images.clone(),
                 };
                 let dir_hash = dir.hash();
-                root_hasher.update_rayon(dir_hash.as_bytes());
+                tracing::debug!(dir = d.format(DATE_FORMAT_DIR).to_string(), ?images, dir_hash = %dir_hash.to_hex(), "images");
+                root_hasher.update(dir_hash.as_bytes());
                 let dir_metadata = DirectoryMetadata {
                     dir_hash,
                     fs_index: idx,
@@ -190,26 +196,19 @@ impl NaiveFs {
         *self.root_hash.read().await == root_hash
     }
 
-    pub async fn get_images_by_hashes(
+    pub async fn get_images_for_date(
         &self,
-        date: NaiveDate,
-        hashes: &[Hash],
-    ) -> Result<Vec<Image>, Error> {
+        date: &NaiveDate,
+    ) -> Result<Vec<(Hash, Image)>, Error> {
         let dir_metadatas = self.dir_metadatas.read().await;
         let DirectoryMetadata { fs_index, .. } = dir_metadatas
-            .get(&date)
+            .get(date)
             .cloned()
-            .ok_or(Error::BadDate(date))?;
+            .ok_or(Error::BadDate(*date))?;
         std::mem::drop(dir_metadatas);
         let dirs = self.dirs.lock().await;
-        let dir = dirs.get(fs_index).ok_or(Error::BadDate(date))?;
-        let images = dir
-            .images
-            .iter()
-            .filter_map(|(hash, i)| hashes.iter().find(|h| **h == *hash).map(|_| i))
-            .cloned()
-            .collect();
+        let dir = dirs.get(fs_index).ok_or(Error::BadDate(*date))?;
 
-        Ok(images)
+        Ok(dir.images.clone())
     }
 }
