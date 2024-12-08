@@ -14,7 +14,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
     mpsc::{channel, Receiver, Sender},
-    oneshot, Notify,
+    Notify,
 };
 
 use libp2p::{
@@ -27,29 +27,31 @@ use tracing_subscriber::EnvFilter;
 use crate::error::Error;
 use crate::filesystem::{NaiveFs, DATE_FORMAT_DIR, DATE_FORMAT_IMG};
 
+use self::filesystem::AVAILABLE_DATES;
+
 const DESIRED_PEERS: usize = 2;
 
-#[derive(Debug)]
-enum SyncCmd {
-    AddPeer(PeerId),
-    AdvanceSync,
-}
-
+// the _peer_id fields are used to make the commands unique
+// so that GS does not dedupe them.
 #[derive(Debug, Deserialize, Serialize)]
 enum SyncMessage {
     AnnounceDirectoryHash {
+        _peer_id: PeerId,
         date: String,
         directory_hash: String,
     },
     AnnounceDirectoryImages {
+        _peer_id: PeerId,
         date: String,
         directory_images: Vec<(String, String)>,
+    },
+    Finished {
+        _peer_id: PeerId,
     },
 }
 
 #[derive(Debug)]
 struct ProcessSyncMessageRequest {
-    pub my_peer_id: PeerId,
     pub from_peer_id: PeerId,
     pub message: SyncMessage,
 }
@@ -62,11 +64,7 @@ enum NodeSyncState {
     /// - .0 is the number of peers we have
     /// - when .0 == DESIRED_PEERS, we can advance.
     WaitingPeers(usize),
-    /// Syncing.
-    /// - .0 is the best date processed
-    /// - when the best date is equal to the target date,
-    /// the sync is considered done.
-    SyncProgress(NaiveDate),
+    SyncProgress,
     /// We synced everything and are shutting down.
     SyncDone,
 }
@@ -90,6 +88,7 @@ struct NodeState {
     pub sync: NodeSyncState,
     pub peers: ArrayVec<PeerId, DESIRED_PEERS>,
     pub date_states: HashMap<NaiveDate, LocalDateState>,
+    pub remaining_to_sync: usize,
 }
 
 /// Placeholder for potential extensibility.
@@ -104,11 +103,9 @@ struct NodeConfig {
 struct Node {
     pub config: NodeConfig,
     pub state: NodeState,
-    pub sync_tx: Sender<SyncCmd>,
-    pub sync_rx: Receiver<SyncCmd>,
     pub gossipsub_tx: Sender<SyncMessage>,
     pub inbound_rx: Receiver<ProcessSyncMessageRequest>,
-    pub next_date_notify: Notify,
+    pub peers_ready: Notify,
     pub fs: NaiveFs,
 }
 
@@ -117,92 +114,51 @@ impl Node {
         fs: NaiveFs,
     ) -> (
         Self,
-        Sender<SyncCmd>,
         Receiver<SyncMessage>,
         Sender<ProcessSyncMessageRequest>,
     ) {
-        // channel to send and receive sync commands
-        let (sync_tx, sync_rx) = channel(1);
         // channel to send and receive gossipsub messages
-        let (gossipsub_tx, gossipsub_rx) = channel(DESIRED_PEERS + 1);
+        let (gossipsub_tx, gossipsub_rx) = channel(100);
         // channels to communicate/receive responses from the mesh
-        let (inbound_tx, inbound_rx) = channel(DESIRED_PEERS + 1);
+        let (inbound_tx, inbound_rx) = channel(100);
 
         let this = Self {
             config: NodeConfig {
                 sync_start_point: crate::filesystem::AVAILABLE_DATES[0],
-                sync_end_point: crate::filesystem::AVAILABLE_DATES[29],
+                sync_end_point: crate::filesystem::AVAILABLE_DATES
+                    [crate::filesystem::AVAILABLE_DATES.len() - 1],
             },
             state: NodeState {
                 sync: NodeSyncState::WaitingPeers(0),
                 peers: Default::default(),
                 date_states: HashMap::new(),
+                remaining_to_sync: AVAILABLE_DATES.len(),
             },
-            sync_tx: sync_tx.clone(),
-            sync_rx,
             gossipsub_tx,
             inbound_rx,
-            next_date_notify: Notify::new(),
+            peers_ready: Notify::new(),
             fs,
         };
 
-        (this, sync_tx, gossipsub_rx, inbound_tx)
+        (this, gossipsub_rx, inbound_tx)
     }
 
-    pub async fn process_sync_cmd(&mut self, cmd: SyncCmd) -> Result<(), Error> {
-        tracing::debug!(?cmd, "Processing sync command");
-        let NodeState {
-            ref mut sync,
-            peers: ref mut regular_peers,
-            ref date_states,
-            ..
-        } = &mut self.state;
-        match cmd {
-            SyncCmd::AddPeer(peer_id) => {
-                let NodeSyncState::WaitingPeers(ref mut available_peers) = sync else {
-                    tracing::warn!(?cmd, state = ?self.state, "Bad state for this cmd");
-                    return Ok(());
-                };
+    pub fn add_peer(&mut self, peer_id: PeerId) -> Result<(), Error> {
+        let NodeSyncState::WaitingPeers(ref mut available_peers) = self.state.sync else {
+            tracing::warn!(state = ?self.state, "Bad state to add peer");
+            return Ok(());
+        };
 
-                if *available_peers < DESIRED_PEERS && !regular_peers.contains(&peer_id) {
-                    tracing::debug!(%peer_id, "adding peer to regular peers");
-                    regular_peers.push(peer_id);
-                    *available_peers += 1;
-                }
+        if *available_peers < DESIRED_PEERS && !self.state.peers.contains(&peer_id) {
+            tracing::debug!(%peer_id, "adding peer to regular peers");
+            self.state.peers.push(peer_id);
+            *available_peers += 1;
+        }
 
-                if *available_peers == DESIRED_PEERS {
-                    tracing::info!("got all peers, starting sync");
-                    *sync = NodeSyncState::SyncProgress(self.config.sync_start_point);
-                    self.next_date_notify.notify_one();
-                }
-            }
-            SyncCmd::AdvanceSync => {
-                let NodeSyncState::SyncProgress(best) = sync else {
-                    tracing::warn!(?cmd, state = ?self.state, "Bad state for this cmd");
-                    return Ok(());
-                };
-                let next = best.succ_opt().unwrap();
-                *best = next;
-                if *best == self.config.sync_end_point {
-                    tracing::info!("processed all dates, ending sync");
-                    *sync = NodeSyncState::SyncDone;
-                    let root_hash = self.fs.root_hash.read().await.to_hex();
-                    tracing::info!(%root_hash, "Sync finished!");
-                    for (date, state) in date_states.iter() {
-                        tracing::info!(
-                            processed_date = %date,
-                            peers_responded = ?state.heard_peers,
-                            dir_images_announced = %state.has_announced_dir_images,
-                            missing_image_locations = ?state.image_locations,
-                            "Stats for the date"
-                        );
-                    }
-
-                    return Ok(());
-                }
-                tracing::debug!(%next, "notifying to process the next date");
-                self.next_date_notify.notify_one();
-            }
+        if *available_peers == DESIRED_PEERS {
+            tracing::info!("got all peers, starting sync");
+            self.state.sync = NodeSyncState::SyncProgress;
+            self.peers_ready.notify_one();
         }
 
         Ok(())
@@ -210,10 +166,10 @@ impl Node {
 
     pub async fn process_message(
         &mut self,
+        my_peer_id: PeerId,
         message_request: ProcessSyncMessageRequest,
     ) -> Result<Option<SyncMessage>, Error> {
         let ProcessSyncMessageRequest {
-            my_peer_id,
             from_peer_id,
             message,
         } = message_request;
@@ -222,6 +178,7 @@ impl Node {
             SyncMessage::AnnounceDirectoryHash {
                 date,
                 directory_hash: announced_directory_hash,
+                ..
             } => {
                 let parsed_date = NaiveDate::parse_from_str(&date, DATE_FORMAT_DIR)
                     .map_err(|_| Error::InvalidDateFormat(date.clone()))?;
@@ -229,14 +186,12 @@ impl Node {
 
                 let my_dir_hash = self.fs.dir_state(&parsed_date).await?;
 
-                if my_dir_hash.to_hex().to_string() == announced_directory_hash
-                    && local_date_state_ref.heard_peers.insert(from_peer_id)
-                    && local_date_state_ref.heard_peers.len() == DESIRED_PEERS
-                {
-                    self.sync_tx
-                        .send(SyncCmd::AdvanceSync)
-                        .await
-                        .expect("channel closed");
+                if my_dir_hash.to_hex().to_string() == announced_directory_hash {
+                    local_date_state_ref.heard_peers.insert(from_peer_id);
+                    if local_date_state_ref.heard_peers.len() == DESIRED_PEERS {
+                        self.state.remaining_to_sync =
+                            self.state.remaining_to_sync.saturating_sub(0);
+                    }
                     return Ok(None);
                 }
 
@@ -258,6 +213,7 @@ impl Node {
                     .collect();
                 local_date_state_ref.has_announced_dir_images = true;
                 Ok(Some(SyncMessage::AnnounceDirectoryImages {
+                    _peer_id: my_peer_id,
                     date,
                     directory_images: my_images_for_this_date,
                 }))
@@ -265,6 +221,7 @@ impl Node {
             SyncMessage::AnnounceDirectoryImages {
                 date,
                 directory_images,
+                ..
             } => {
                 let parsed_date = NaiveDate::parse_from_str(&date, DATE_FORMAT_DIR)
                     .map_err(|_| Error::InvalidDateFormat(date.clone()))?;
@@ -281,64 +238,93 @@ impl Node {
                     directory_images.into_iter().map(|(_, hash)| hash),
                 );
 
-                if local_date_state_ref.heard_peers.insert(from_peer_id)
-                    && local_date_state_ref.heard_peers.len() == DESIRED_PEERS
-                {
-                    self.sync_tx
-                        .send(SyncCmd::AdvanceSync)
-                        .await
-                        .expect("channel closed");
-                }
                 for img_hash in have_images.difference(&provided_images) {
                     local_date_state_ref
                         .image_locations
                         .insert(img_hash.clone(), from_peer_id);
                 }
+                local_date_state_ref.heard_peers.insert(from_peer_id);
+                if local_date_state_ref.heard_peers.len() == DESIRED_PEERS {
+                    self.state.remaining_to_sync = self.state.remaining_to_sync.saturating_sub(1);
+                }
 
+                Ok(None)
+            }
+            SyncMessage::Finished { _peer_id } => {
+                tracing::info!(%from_peer_id, "Peer says it has synced");
+                self.state.peers.retain(|p| *p != from_peer_id);
                 Ok(None)
             }
         }
     }
 
-    pub async fn run(&mut self, finish_tx: oneshot::Sender<()>) -> Result<(), Error> {
+    pub async fn run(&mut self, my_peer_id: PeerId) -> Result<(), Error> {
         loop {
             tokio::select! {
-                cmd = self.sync_rx.recv() => {
-                    self.process_sync_cmd(cmd.expect("channel closed")).await?;
-                    if matches!(self.state.sync, NodeSyncState::SyncDone) {
-                        tracing::info!("finished sync");
-                        finish_tx.send(()).expect("finish channel closed");
-                        break Ok(());
-                    }
-                },
-                _ = self.next_date_notify.notified() => {
+                _ = self.peers_ready.notified() => {
                     tracing::trace!("Requested to perform sync");
 
-                    let NodeSyncState::SyncProgress(ref best_date) = self.state.sync else {
-                        unreachable!();
-                    };
+                    let mut processing_date = self.config.sync_start_point;
+                    let end_date = self.config.sync_end_point;
+                    while processing_date != end_date {
+                        tracing::trace!(%processing_date, "Processing sync for date");
+                        let processing_date_pretty = processing_date.format(DATE_FORMAT_DIR).to_string();
+                        let my_hash = self
+                            .fs
+                            .dir_state(&processing_date)
+                            .await?;
 
-                    let processing_date = best_date.succ_opt().unwrap();
-                    tracing::trace!(%processing_date, "Processing sync for date");
-                    let processing_date_pretty = processing_date.format(DATE_FORMAT_DIR).to_string();
+                        self.gossipsub_tx
+                            .send(SyncMessage::AnnounceDirectoryHash {
+                                _peer_id: my_peer_id,
+                                date: processing_date_pretty,
+                                directory_hash: my_hash.to_hex().to_string()
+                            })
+                            .await
+                            .expect("channel closed");
+                        processing_date = processing_date.succ_opt().unwrap();
+                    }
 
-                    let my_hash = self
-                        .fs
-                        .dir_state(&processing_date)
-                        .await?;
 
-                    self.gossipsub_tx
-                        .send(SyncMessage::AnnounceDirectoryHash { date: processing_date_pretty, directory_hash: my_hash.to_hex().to_string() })
-                        .await
-                        .expect("channel closed");
                 },
                 inbound_msg = self.inbound_rx.recv() => {
-                    tracing::debug!(?inbound_msg, "Processing inbound message");
-                    let maybe_response = self.process_message(inbound_msg.expect("channel closed")).await?;
-                    if let Some(response) = maybe_response {
-                        tracing::trace!(?response, "want to reply");
-                        self.gossipsub_tx.send(response).await.expect("channel closed");
-                    }
+                        tracing::debug!(?inbound_msg, "Processing inbound message");
+                        let maybe_response = self
+                            .process_message(my_peer_id, inbound_msg.expect("channel closed"))
+                            .await?;
+                        if let Some(response) = maybe_response {
+                            tracing::trace!(?response, "want to reply");
+                            self.gossipsub_tx
+                                .send(response)
+                                .await
+                                .expect("channel closed");
+                        }
+
+                        // tracing::info!(?self.state.sync, ?self.state.peers, ?self.state.remaining_to_sync, "LAST STATE");
+                        if self.state.remaining_to_sync == 0 && matches!(self.state.sync, NodeSyncState::SyncProgress) {
+                            for (date, state) in self.state.date_states.iter() {
+                                tracing::info!(
+                                    processed_date = %date,
+                                    peers_responded = ?state.heard_peers,
+                                    dir_images_announced = %state.has_announced_dir_images,
+                                    missing_image_locations = ?state.image_locations,
+                                    "Stats for the date"
+                                );
+                            }
+                            self.state.sync = NodeSyncState::SyncDone;
+                            tracing::info!("saying bye");
+
+                            self.gossipsub_tx
+                                .send(SyncMessage::Finished {
+                                    _peer_id: my_peer_id,
+                                })
+                                .await
+                                .expect("channel closed");
+                        }
+                        if self.state.peers.len() == 0 && matches!(self.state.sync, NodeSyncState::SyncDone) {
+                            tracing::info!("finished sync and processed all peer messages");
+                            break Ok(());
+                        }
                 }
             }
         }
@@ -369,8 +355,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
         .with_behaviour(|key| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10)) 
-                .validation_mode(gossipsub::ValidationMode::Strict) 
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .message_id_fn(|_m| {
+                    use rand::RngCore;
+                    let mut v: Vec<u8> = vec![0u8; 32];
+                    rand::thread_rng().try_fill_bytes(&mut v).unwrap();
+                    gossipsub::MessageId(v)
+                })
                 .build()?;
 
             let gossipsub = gossipsub::Behaviour::new(
@@ -387,22 +379,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Tell the swarm to listen on bcast and a random, OS-assigned
     // port.
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    let listener_id = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
     let topic = gossipsub::IdentTopic::new("image-sync");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     let fs = filesystem::NaiveFs::random();
 
-    let (mut node, sync_tx, mut gossipsub_rx, inbound_tx) = Node::create_with_fs(fs);
-    let (finish_tx, mut finish_rx) = tokio::sync::oneshot::channel::<()>();
-
-    tokio::task::spawn(async move {
-        if let Err(e) = node.run(finish_tx).await {
-            tracing::error!(%e, "Node exited with error");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(5_000)).await;
-    });
+    let (mut node, mut gossipsub_rx, inbound_tx) = Node::create_with_fs(fs);
     loop {
         tokio::select! {
             event = swarm.select_next_some() => match event {
@@ -416,6 +400,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for (peer_id, _multiaddr) in list {
                         tracing::debug!(%my_peer_id, expired_peer_id = %peer_id, "mDNS discover peer has expired");
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        // swarm.behaviour_mut().gossipsub.(&peer_id);
+
                     }
                 },
                 SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
@@ -429,7 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             subscribed_to_topic = %subscribed_to_topic.as_str(),
                             "New topic peer"
                         );
-                        sync_tx.send(SyncCmd::AddPeer(peer_id)).await?;
+                        node.add_peer(peer_id)?;
                     }
 
                 }
@@ -438,18 +424,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     message_id: id,
                     message,
                 })) => {
-                    let received_message = serde_json::from_slice::<SyncMessage>(&message.data).expect("expected a valid message");
-                    tracing::debug!(%id, from = %peer_id, ?received_message, "Got message from gossipsub");
+                    let received_message =
+                        serde_json::from_slice::<SyncMessage>(&message.data).expect("expected a valid message");
+                    tracing::info!(%id, from = %peer_id, ?received_message, "Got message from gossipsub");
 
-                    inbound_tx.send(
-                        ProcessSyncMessageRequest {
-                            my_peer_id,
+                    inbound_tx
+                        .send(ProcessSyncMessageRequest {
                             from_peer_id: peer_id,
                             message: received_message,
-                        }
-                    )
-                    .await
-                    .expect("channel closed");
+                        })
+                        .await
+                        .expect("channel closed");
                 },
                 SwarmEvent::NewListenAddr { address, .. } => {
                     tracing::info!("Local node is listening on {address}");
@@ -459,7 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             request = gossipsub_rx.recv() => {
-                tracing::debug!(?request, "want to send request to network");
+                tracing::info!(?request, "want to send request to network");
                 let request_bytes = serde_json::to_vec(&request.expect("channel closed")).unwrap();
 
                 if let Err(e) = swarm
@@ -470,10 +455,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::error!(%e, "failed to send request to the mesh");
                 }
             },
-            _ = &mut finish_rx => {
-                tracing::debug!("finish_rx triggered, bye!");
-                break Ok(());
+            res = node.run(my_peer_id) => {
+                tracing::info!(?res, "Node exited");
+                break ();
             },
+            _ = tokio::signal::ctrl_c() => {
+                break ();
+            }
         }
     }
+
+    swarm.remove_listener(listener_id);
+
+    Ok(())
 }

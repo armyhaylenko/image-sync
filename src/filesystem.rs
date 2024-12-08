@@ -69,12 +69,7 @@ pub struct Image {
 
 impl std::fmt::Debug for Image {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "|{}| {:?}...",
-            self.created_at,
-            self.hash().to_hex()
-        )
+        write!(f, "|{}| {:?}...", self.created_at, self.hash().to_hex())
     }
 }
 
@@ -88,7 +83,13 @@ impl Image {
         tracing::trace!(img_name = %self.created_at, "Hashing self");
 
         Hasher::new()
-            .update(&self.created_at.format("%Y-%m-%d:%h-%M-%s").to_string().as_bytes())
+            .update(
+                &self
+                    .created_at
+                    .format("%Y-%m-%d:%h-%M-%s")
+                    .to_string()
+                    .as_bytes(),
+            )
             .finalize()
     }
 }
@@ -192,14 +193,7 @@ impl NaiveFs {
             .dir_hash)
     }
 
-    pub async fn synced_to_root(&self, root_hash: Hash) -> bool {
-        *self.root_hash.read().await == root_hash
-    }
-
-    pub async fn get_images_for_date(
-        &self,
-        date: &NaiveDate,
-    ) -> Result<Vec<(Hash, Image)>, Error> {
+    pub async fn get_images_for_date(&self, date: &NaiveDate) -> Result<Vec<(Hash, Image)>, Error> {
         let dir_metadatas = self.dir_metadatas.read().await;
         let DirectoryMetadata { fs_index, .. } = dir_metadatas
             .get(date)
