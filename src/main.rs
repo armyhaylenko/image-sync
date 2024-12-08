@@ -184,13 +184,13 @@ impl Node {
                     .map_err(|_| Error::InvalidDateFormat(date.clone()))?;
                 let local_date_state_ref = self.state.date_states.entry(parsed_date).or_default();
 
-                let my_dir_hash = self.fs.dir_state(&parsed_date).await?;
+                let my_dir_hash = self.fs.dir_state(&parsed_date)?;
 
                 if my_dir_hash.to_hex().to_string() == announced_directory_hash {
                     local_date_state_ref.heard_peers.insert(from_peer_id);
                     if local_date_state_ref.heard_peers.len() == DESIRED_PEERS {
                         self.state.remaining_to_sync =
-                            self.state.remaining_to_sync.saturating_sub(0);
+                            self.state.remaining_to_sync.saturating_sub(1);
                     }
                     return Ok(None);
                 }
@@ -271,8 +271,7 @@ impl Node {
                         let processing_date_pretty = processing_date.format(DATE_FORMAT_DIR).to_string();
                         let my_hash = self
                             .fs
-                            .dir_state(&processing_date)
-                            .await?;
+                            .dir_state(&processing_date)?;
 
                         self.gossipsub_tx
                             .send(SyncMessage::AnnounceDirectoryHash {
@@ -343,6 +342,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+    let fs_test_case = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "random".to_owned());
+    let fs = if &fs_test_case == "full" {
+        filesystem::NaiveFs::full()
+    } else {
+        filesystem::NaiveFs::random()
+    };
+
+    tracing::info!(fs_type = %fs_test_case, "Created filesystem");
 
     let key = libp2p::identity::Keypair::generate_ed25519();
     let my_peer_id = key.public().to_peer_id();
@@ -384,8 +393,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let topic = gossipsub::IdentTopic::new("image-sync");
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
-    let fs = filesystem::NaiveFs::random();
-
     let (mut node, mut gossipsub_rx, inbound_tx) = Node::create_with_fs(fs);
     loop {
         tokio::select! {
@@ -400,7 +407,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for (peer_id, _multiaddr) in list {
                         tracing::debug!(%my_peer_id, expired_peer_id = %peer_id, "mDNS discover peer has expired");
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                        // swarm.behaviour_mut().gossipsub.(&peer_id);
 
                     }
                 },
@@ -409,7 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     topic: subscribed_to_topic,
                 })) => {
                     if subscribed_to_topic == topic.hash() {
-                        tracing::info!(
+                        tracing::debug!(
                             %my_peer_id,
                             subscriber_peer_id = %peer_id,
                             subscribed_to_topic = %subscribed_to_topic.as_str(),
@@ -426,7 +432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })) => {
                     let received_message =
                         serde_json::from_slice::<SyncMessage>(&message.data).expect("expected a valid message");
-                    tracing::info!(%id, from = %peer_id, ?received_message, "Got message from gossipsub");
+                    tracing::debug!(%id, from = %peer_id, ?received_message, "Got message from gossipsub");
 
                     inbound_tx
                         .send(ProcessSyncMessageRequest {
@@ -444,7 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             request = gossipsub_rx.recv() => {
-                tracing::info!(?request, "want to send request to network");
+                tracing::debug!(?request, "want to send request to network");
                 let request_bytes = serde_json::to_vec(&request.expect("channel closed")).unwrap();
 
                 if let Err(e) = swarm

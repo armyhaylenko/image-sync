@@ -1,8 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use blake3::{Hash, Hasher};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use tokio::sync::{Mutex, RwLock};
 
 use crate::error::Error;
 
@@ -97,6 +96,7 @@ impl Image {
 #[derive(Debug)]
 pub struct Directory {
     /// actual value we care about for the sync
+    #[allow(dead_code)]
     pub date: NaiveDate,
     /// images inside of the directory, assuming sorted by creation
     pub images: Vec<(Hash, Image)>,
@@ -123,19 +123,15 @@ impl Directory {
 
 #[derive(Debug)]
 pub struct NaiveFs {
-    /// Root hash of the filesystem. Once all the root hashes
-    /// of the peers become equal, we know the sync is finished.
-    pub root_hash: Arc<RwLock<Hash>>,
     /// Assuming that we only have directories in the fs
     /// The obv choice for such task is an MPT, but i want to rely
     /// on libraries as least as possible.
-    ///
-    /// the RwLock is used for easy concurrent accesses
-    pub dir_metadatas: Arc<RwLock<HashMap<NaiveDate, DirectoryMetadata>>>,
-    pub dirs: Arc<Mutex<Vec<Directory>>>,
+    pub dir_metadatas: HashMap<NaiveDate, DirectoryMetadata>,
+    pub dirs: Vec<Directory>,
 }
 
 impl NaiveFs {
+    /// Creates a random fs.
     pub fn random() -> Self {
         let mut root_hasher = Hasher::new();
         let gen_directory_images = |date: NaiveDate| -> Vec<(Hash, Image)> {
@@ -177,31 +173,72 @@ impl NaiveFs {
         let dirs = dirs.into_iter().map(|(_, dir, _)| dir).collect();
 
         Self {
-            root_hash: Arc::new(RwLock::new(root_hasher.finalize())),
-            dir_metadatas: Arc::new(RwLock::new(HashMap::from_iter(directory_metadatas))),
-            dirs: Arc::new(Mutex::new(dirs)),
+            dir_metadatas: HashMap::from_iter(directory_metadatas),
+            dirs,
         }
     }
 
-    pub async fn dir_state(&self, date: &NaiveDate) -> Result<Hash, Error> {
+    /// Creates a fully filled fs.
+    pub fn full() -> Self {
+        let mut root_hasher = Hasher::new();
+        let gen_directory_images = |date: NaiveDate| -> Vec<(Hash, Image)> {
+            AVAILABLE_TIMES
+                .into_iter()
+                .map(|t| {
+                    let i = Image::new(NaiveDateTime::new(date, t));
+                    let hash = i.hash();
+                    (hash, i)
+                })
+                .collect()
+        };
+        let dirs: Vec<(NaiveDate, Directory, DirectoryMetadata)> = AVAILABLE_DATES
+            .into_iter()
+            .enumerate()
+            .map(|(idx, d)| {
+                let images = gen_directory_images(d);
+                let dir = Directory {
+                    date: d,
+                    // TODO: remove the clone
+                    images: images.clone(),
+                };
+                let dir_hash = dir.hash();
+                root_hasher.update(dir_hash.as_bytes());
+                let dir_metadata = DirectoryMetadata {
+                    dir_hash,
+                    fs_index: idx,
+                };
+                (d, dir, dir_metadata)
+            })
+            // the hashmap
+            .collect();
+
+        let directory_metadatas = dirs
+            .iter()
+            .map(|(date, _, meta)| (*date, *meta))
+            .collect::<Vec<(NaiveDate, DirectoryMetadata)>>();
+        let dirs = dirs.into_iter().map(|(_, dir, _)| dir).collect();
+
+        Self {
+            dir_metadatas: HashMap::from_iter(directory_metadatas),
+            dirs,
+        }
+    }
+
+    pub fn dir_state(&self, date: &NaiveDate) -> Result<Hash, Error> {
         Ok(self
             .dir_metadatas
-            .read()
-            .await
             .get(date)
             .ok_or(Error::BadDate(*date))?
             .dir_hash)
     }
 
     pub async fn get_images_for_date(&self, date: &NaiveDate) -> Result<Vec<(Hash, Image)>, Error> {
-        let dir_metadatas = self.dir_metadatas.read().await;
-        let DirectoryMetadata { fs_index, .. } = dir_metadatas
+        let DirectoryMetadata { fs_index, .. } = self
+            .dir_metadatas
             .get(date)
             .cloned()
             .ok_or(Error::BadDate(*date))?;
-        std::mem::drop(dir_metadatas);
-        let dirs = self.dirs.lock().await;
-        let dir = dirs.get(fs_index).ok_or(Error::BadDate(*date))?;
+        let dir = self.dirs.get(fs_index).ok_or(Error::BadDate(*date))?;
 
         Ok(dir.images.clone())
     }

@@ -6,8 +6,4 @@ pub enum Error {
     BadDate(NaiveDate),
     #[error("Could not parse date: {0}")]
     InvalidDateFormat(String),
-    #[error("Could not parse hex-encoded hashes from the request")]
-    InvalidHashFormat,
-    #[error("Something went wrong...")]
-    InternalError,
 }
