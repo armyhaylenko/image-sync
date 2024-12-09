@@ -39,3 +39,9 @@ in 3 different terminals.
 Unfortunately, this implementation is not perfect.
 I did not find how to force the swarm to flush the connections, and the process sometimes hangs.
 The stats are still printed though, meaning the node could report about the desired locations.
+
+## Verifying correctness
+
+It is sufficient to compare the would-be root hashes of the peers.
+For the full fs, the value is `0036b4a7ce8b6bdfd2e513ae390f08002c5b3fac38d3f3ffe3f4a6f62eafa148`.
+For random filesystems, the values are different, but each peer comes to the same value.

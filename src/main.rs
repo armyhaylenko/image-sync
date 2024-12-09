@@ -9,6 +9,7 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
+use blake3::{Hash, Hasher};
 use chrono::NaiveDate;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -45,9 +46,6 @@ enum SyncMessage {
         date: String,
         directory_images: Vec<(String, String)>,
     },
-    Finished {
-        _peer_id: PeerId,
-    },
 }
 
 #[derive(Debug)]
@@ -76,11 +74,13 @@ enum NodeSyncState {
 /// and when either all the peers agree on the date and dir contents,
 /// or annonce their own contents so we could sync, the date is considered
 /// processes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct LocalDateState {
     has_announced_dir_images: bool,
     image_locations: HashMap<String, PeerId>,
-    heard_peers: HashSet<PeerId>,
+    heard_hash_peers: HashSet<PeerId>,
+    heard_dir_peers: HashSet<PeerId>,
+    closed: bool,
 }
 
 #[derive(Debug)]
@@ -186,17 +186,21 @@ impl Node {
 
                 let my_dir_hash = self.fs.dir_state(&parsed_date)?;
 
+                if local_date_state_ref.closed {
+                    return Ok(None)
+                }
+
                 if my_dir_hash.to_hex().to_string() == announced_directory_hash {
-                    local_date_state_ref.heard_peers.insert(from_peer_id);
-                    if local_date_state_ref.heard_peers.len() == DESIRED_PEERS {
-                        self.state.remaining_to_sync =
-                            self.state.remaining_to_sync.saturating_sub(1);
+                    local_date_state_ref.heard_hash_peers.insert(from_peer_id);
+                    if local_date_state_ref.heard_hash_peers.len() == DESIRED_PEERS {
+                        self.state.remaining_to_sync -= 1;
+                        local_date_state_ref.closed = true;
                     }
                     return Ok(None);
                 }
-
+                
                 if local_date_state_ref.has_announced_dir_images {
-                    return Ok(None);
+                    return Ok(None)
                 }
 
                 let my_images_for_this_date = self
@@ -211,6 +215,7 @@ impl Node {
                         )
                     })
                     .collect();
+
                 local_date_state_ref.has_announced_dir_images = true;
                 Ok(Some(SyncMessage::AnnounceDirectoryImages {
                     _peer_id: my_peer_id,
@@ -238,21 +243,17 @@ impl Node {
                     directory_images.into_iter().map(|(_, hash)| hash),
                 );
 
-                for img_hash in have_images.difference(&provided_images) {
+                for img_hash in provided_images.difference(&have_images) {
                     local_date_state_ref
                         .image_locations
                         .insert(img_hash.clone(), from_peer_id);
                 }
-                local_date_state_ref.heard_peers.insert(from_peer_id);
-                if local_date_state_ref.heard_peers.len() == DESIRED_PEERS {
-                    self.state.remaining_to_sync = self.state.remaining_to_sync.saturating_sub(1);
+                local_date_state_ref.heard_dir_peers.insert(from_peer_id);
+                if local_date_state_ref.heard_dir_peers.len() == DESIRED_PEERS && !local_date_state_ref.closed {
+                    self.state.remaining_to_sync -= 1;
+                    local_date_state_ref.closed = true;
                 }
 
-                Ok(None)
-            }
-            SyncMessage::Finished { _peer_id } => {
-                tracing::info!(%from_peer_id, "Peer says it has synced");
-                self.state.peers.retain(|p| *p != from_peer_id);
                 Ok(None)
             }
         }
@@ -266,7 +267,7 @@ impl Node {
 
                     let mut processing_date = self.config.sync_start_point;
                     let end_date = self.config.sync_end_point;
-                    while processing_date != end_date {
+                    while processing_date != end_date.succ_opt().unwrap() {
                         tracing::trace!(%processing_date, "Processing sync for date");
                         let processing_date_pretty = processing_date.format(DATE_FORMAT_DIR).to_string();
                         let my_hash = self
@@ -299,30 +300,34 @@ impl Node {
                                 .expect("channel closed");
                         }
 
-                        // tracing::info!(?self.state.sync, ?self.state.peers, ?self.state.remaining_to_sync, "LAST STATE");
+
                         if self.state.remaining_to_sync == 0 && matches!(self.state.sync, NodeSyncState::SyncProgress) {
-                            for (date, state) in self.state.date_states.iter() {
+                            let mut root_hasher = Hasher::new();
+                            let mut iter = self.state.date_states.clone().into_iter().collect::<Vec<_>>();
+                            iter.sort_by_key(|(date, _)| *date);
+                            for (date, state) in iter {
+                                let total_missing = state.image_locations.len();
+                                let mut theoretical_dir = self.fs.get_images_for_date(&date).await?.into_iter().map(|(h, _img)| h)
+                                    .chain(state.image_locations.keys().map(|k| Hash::from_hex(k).unwrap())).collect::<Vec<Hash>>();
+                                theoretical_dir.sort_by_key(|h| *h.as_bytes());
+                                let theoretical_dir_hash = theoretical_dir.into_iter().reduce(|h1, h2| {
+                                    blake3::Hasher::new().update(h1.as_bytes()).update(h2.as_bytes()).finalize()
+                                }).unwrap();
+                                root_hasher.update(theoretical_dir_hash.as_bytes());
                                 tracing::info!(
                                     processed_date = %date,
-                                    peers_responded = ?state.heard_peers,
-                                    dir_images_announced = %state.has_announced_dir_images,
-                                    missing_image_locations = ?state.image_locations,
+                                    // hash_peers_responded = ?state.heard_hash_peers,
+                                    // dir_peers_responded = ?state.heard_dir_peers,
+                                    // dir_images_announced = %state.has_announced_dir_images,
+                                    // missing_image_locations = ?state.image_locations,
+                                    total_was_missing = ?total_missing,
+                                    theoretical_dir_hash = %theoretical_dir_hash.to_hex(),
                                     "Stats for the date"
                                 );
                             }
+                            let theoretical_root_hash = root_hasher.finalize();
                             self.state.sync = NodeSyncState::SyncDone;
-                            tracing::info!("saying bye");
-
-                            self.gossipsub_tx
-                                .send(SyncMessage::Finished {
-                                    _peer_id: my_peer_id,
-                                })
-                                .await
-                                .expect("channel closed");
-                        }
-                        if self.state.peers.len() == 0 && matches!(self.state.sync, NodeSyncState::SyncDone) {
-                            tracing::info!("finished sync and processed all peer messages");
-                            break Ok(());
+                            tracing::info!(theoretical_root_hash = %theoretical_root_hash.to_hex(), "saying bye");
                         }
                 }
             }

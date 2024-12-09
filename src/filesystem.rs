@@ -6,7 +6,7 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use crate::error::Error;
 
 pub const DATE_FORMAT_DIR: &str = "%Y-%m-%d";
-pub const DATE_FORMAT_IMG: &str = "%Y-%m-%d:%h-%M-%s";
+pub const DATE_FORMAT_IMG: &str = "%Y-%m-%d:%H-%M-%S";
 pub const AVAILABLE_DATES: [NaiveDate; 30] = [
     NaiveDate::from_ymd_opt(2024, 12, 1).unwrap(),
     NaiveDate::from_ymd_opt(2024, 12, 2).unwrap(),
@@ -85,7 +85,7 @@ impl Image {
             .update(
                 &self
                     .created_at
-                    .format("%Y-%m-%d:%h-%M-%s")
+                    .format(DATE_FORMAT_IMG)
                     .to_string()
                     .as_bytes(),
             )
@@ -133,7 +133,6 @@ pub struct NaiveFs {
 impl NaiveFs {
     /// Creates a random fs.
     pub fn random() -> Self {
-        let mut root_hasher = Hasher::new();
         let gen_directory_images = |date: NaiveDate| -> Vec<(Hash, Image)> {
             gen_image_times(date)
                 .into_iter()
@@ -148,15 +147,15 @@ impl NaiveFs {
             .into_iter()
             .enumerate()
             .map(|(idx, d)| {
-                let images = gen_directory_images(d);
+                let mut images = gen_directory_images(d);
+                images.sort_unstable_by_key(|k| k.1.created_at);
                 let dir = Directory {
                     date: d,
                     // TODO: remove the clone
                     images: images.clone(),
                 };
                 let dir_hash = dir.hash();
-                tracing::debug!(dir = d.format(DATE_FORMAT_DIR).to_string(), ?images, dir_hash = %dir_hash.to_hex(), "images");
-                root_hasher.update(dir_hash.as_bytes());
+                // tracing::debug!(dir = d.format(DATE_FORMAT_DIR).to_string(), ?images, dir_hash = %dir_hash.to_hex(), "images");
                 let dir_metadata = DirectoryMetadata {
                     dir_hash,
                     fs_index: idx,
@@ -170,7 +169,8 @@ impl NaiveFs {
             .iter()
             .map(|(date, _, meta)| (*date, *meta))
             .collect::<Vec<(NaiveDate, DirectoryMetadata)>>();
-        let dirs = dirs.into_iter().map(|(_, dir, _)| dir).collect();
+        let mut dirs: Vec<_> = dirs.into_iter().map(|(_, dir, _)| dir).collect();
+        dirs.sort_unstable_by_key(|d| d.date);
 
         Self {
             dir_metadatas: HashMap::from_iter(directory_metadatas),
@@ -180,7 +180,6 @@ impl NaiveFs {
 
     /// Creates a fully filled fs.
     pub fn full() -> Self {
-        let mut root_hasher = Hasher::new();
         let gen_directory_images = |date: NaiveDate| -> Vec<(Hash, Image)> {
             AVAILABLE_TIMES
                 .into_iter()
@@ -195,14 +194,15 @@ impl NaiveFs {
             .into_iter()
             .enumerate()
             .map(|(idx, d)| {
-                let images = gen_directory_images(d);
+                let mut images = gen_directory_images(d);
+                images.sort_unstable_by_key(|k| k.1.created_at);
+
                 let dir = Directory {
                     date: d,
                     // TODO: remove the clone
                     images: images.clone(),
                 };
                 let dir_hash = dir.hash();
-                root_hasher.update(dir_hash.as_bytes());
                 let dir_metadata = DirectoryMetadata {
                     dir_hash,
                     fs_index: idx,
@@ -216,7 +216,8 @@ impl NaiveFs {
             .iter()
             .map(|(date, _, meta)| (*date, *meta))
             .collect::<Vec<(NaiveDate, DirectoryMetadata)>>();
-        let dirs = dirs.into_iter().map(|(_, dir, _)| dir).collect();
+        let mut dirs: Vec<_> = dirs.into_iter().map(|(_, dir, _)| dir).collect();
+        dirs.sort_unstable_by_key(|d| d.date);
 
         Self {
             dir_metadatas: HashMap::from_iter(directory_metadatas),
