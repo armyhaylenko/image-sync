@@ -151,11 +151,9 @@ impl NaiveFs {
                 images.sort_unstable_by_key(|k| k.1.created_at);
                 let dir = Directory {
                     date: d,
-                    // TODO: remove the clone
-                    images: images.clone(),
+                    images,
                 };
                 let dir_hash = dir.hash();
-                // tracing::debug!(dir = d.format(DATE_FORMAT_DIR).to_string(), ?images, dir_hash = %dir_hash.to_hex(), "images");
                 let dir_metadata = DirectoryMetadata {
                     dir_hash,
                     fs_index: idx,

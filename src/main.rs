@@ -316,10 +316,6 @@ impl Node {
                                 root_hasher.update(theoretical_dir_hash.as_bytes());
                                 tracing::info!(
                                     processed_date = %date,
-                                    // hash_peers_responded = ?state.heard_hash_peers,
-                                    // dir_peers_responded = ?state.heard_dir_peers,
-                                    // dir_images_announced = %state.has_announced_dir_images,
-                                    // missing_image_locations = ?state.image_locations,
                                     total_was_missing = ?total_missing,
                                     theoretical_dir_hash = %theoretical_dir_hash.to_hex(),
                                     "Stats for the date"
