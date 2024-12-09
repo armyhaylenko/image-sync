@@ -1,12 +1,10 @@
-use std::collections::HashMap;
-
 use blake3::{Hash, Hasher};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
 use crate::error::Error;
 
 pub const DATE_FORMAT_DIR: &str = "%Y-%m-%d";
-pub const DATE_FORMAT_IMG: &str = "%Y-%m-%d:%h-%M-%s";
+pub const DATE_FORMAT_IMG: &str = "%Y-%m-%d:%H-%M-%S";
 pub const AVAILABLE_DATES: [NaiveDate; 30] = [
     NaiveDate::from_ymd_opt(2024, 12, 1).unwrap(),
     NaiveDate::from_ymd_opt(2024, 12, 2).unwrap(),
@@ -85,7 +83,7 @@ impl Image {
             .update(
                 &self
                     .created_at
-                    .format("%Y-%m-%d:%h-%M-%s")
+                    .format(DATE_FORMAT_IMG)
                     .to_string()
                     .as_bytes(),
             )
@@ -102,14 +100,6 @@ pub struct Directory {
     pub images: Vec<(Hash, Image)>,
 }
 
-/// This struct holds the metadata of the directory.
-/// Primary sync primitive.
-#[derive(Debug, Clone, Copy)]
-pub struct DirectoryMetadata {
-    pub dir_hash: Hash,
-    pub fs_index: usize,
-}
-
 impl Directory {
     fn hash(&self) -> Hash {
         let mut hasher = Hasher::new();
@@ -123,17 +113,13 @@ impl Directory {
 
 #[derive(Debug)]
 pub struct NaiveFs {
-    /// Assuming that we only have directories in the fs
-    /// The obv choice for such task is an MPT, but i want to rely
-    /// on libraries as least as possible.
-    pub dir_metadatas: HashMap<NaiveDate, DirectoryMetadata>,
+    pub root_hash: Option<Hash>,
     pub dirs: Vec<Directory>,
 }
 
 impl NaiveFs {
     /// Creates a random fs.
     pub fn random() -> Self {
-        let mut root_hasher = Hasher::new();
         let gen_directory_images = |date: NaiveDate| -> Vec<(Hash, Image)> {
             gen_image_times(date)
                 .into_iter()
@@ -144,43 +130,28 @@ impl NaiveFs {
                 })
                 .collect()
         };
-        let dirs: Vec<(NaiveDate, Directory, DirectoryMetadata)> = AVAILABLE_DATES
+        let dirs: Vec<Directory> = AVAILABLE_DATES
             .into_iter()
-            .enumerate()
-            .map(|(idx, d)| {
+            .map(|d| {
                 let images = gen_directory_images(d);
                 let dir = Directory {
                     date: d,
                     // TODO: remove the clone
                     images: images.clone(),
                 };
-                let dir_hash = dir.hash();
-                tracing::debug!(dir = d.format(DATE_FORMAT_DIR).to_string(), ?images, dir_hash = %dir_hash.to_hex(), "images");
-                root_hasher.update(dir_hash.as_bytes());
-                let dir_metadata = DirectoryMetadata {
-                    dir_hash,
-                    fs_index: idx,
-                };
-                (d, dir, dir_metadata)
+                dir
             }) // return both the date and the dir to build
             // the hashmap
             .collect();
 
-        let directory_metadatas = dirs
-            .iter()
-            .map(|(date, _, meta)| (*date, *meta))
-            .collect::<Vec<(NaiveDate, DirectoryMetadata)>>();
-        let dirs = dirs.into_iter().map(|(_, dir, _)| dir).collect();
-
         Self {
-            dir_metadatas: HashMap::from_iter(directory_metadatas),
             dirs,
+            root_hash: None,
         }
     }
 
     /// Creates a fully filled fs.
     pub fn full() -> Self {
-        let mut root_hasher = Hasher::new();
         let gen_directory_images = |date: NaiveDate| -> Vec<(Hash, Image)> {
             AVAILABLE_TIMES
                 .into_iter()
@@ -191,54 +162,75 @@ impl NaiveFs {
                 })
                 .collect()
         };
-        let dirs: Vec<(NaiveDate, Directory, DirectoryMetadata)> = AVAILABLE_DATES
+        let dirs: Vec<Directory> = AVAILABLE_DATES
             .into_iter()
-            .enumerate()
-            .map(|(idx, d)| {
+            .map(|d| {
                 let images = gen_directory_images(d);
                 let dir = Directory {
                     date: d,
                     // TODO: remove the clone
                     images: images.clone(),
                 };
-                let dir_hash = dir.hash();
-                root_hasher.update(dir_hash.as_bytes());
-                let dir_metadata = DirectoryMetadata {
-                    dir_hash,
-                    fs_index: idx,
-                };
-                (d, dir, dir_metadata)
+                dir
             })
             // the hashmap
             .collect();
 
-        let directory_metadatas = dirs
-            .iter()
-            .map(|(date, _, meta)| (*date, *meta))
-            .collect::<Vec<(NaiveDate, DirectoryMetadata)>>();
-        let dirs = dirs.into_iter().map(|(_, dir, _)| dir).collect();
-
         Self {
-            dir_metadatas: HashMap::from_iter(directory_metadatas),
+            root_hash: None,
             dirs,
         }
     }
 
+    pub fn add_image(&mut self, date: NaiveDate, image: Image) -> Result<(), Error> {
+        let dir = self
+            .dirs
+            .iter_mut()
+            .find(|d| d.date == date)
+            .ok_or(Error::BadDate(date))?;
+        if dir
+            .images
+            .iter()
+            .any(|(h, i)| h == &image.hash() || i.created_at == image.created_at)
+        {
+            // do not insert duplicates
+            return Ok(());
+        }
+        dir.images.push((image.hash(), image));
+        dir.images.sort_by_key(|(_hash, image)| image.created_at);
+
+        Ok(())
+    }
+
+    pub fn update_root_hash(&mut self) {
+        let mut root_hasher = Hasher::new();
+        self.dirs.sort_by_key(|d| d.date);
+        self.dirs.iter_mut().for_each(|d| {
+            d.images.sort_by_key(|(_h, i)| i.created_at);
+        });
+
+        for d in self.dirs.iter() {
+            root_hasher.update(d.hash().as_bytes());
+        }
+
+        self.root_hash = Some(root_hasher.finalize());
+    }
+
     pub fn dir_state(&self, date: &NaiveDate) -> Result<Hash, Error> {
         Ok(self
-            .dir_metadatas
-            .get(date)
+            .dirs
+            .iter()
+            .find(|d| &d.date == date)
             .ok_or(Error::BadDate(*date))?
-            .dir_hash)
+            .hash())
     }
 
     pub async fn get_images_for_date(&self, date: &NaiveDate) -> Result<Vec<(Hash, Image)>, Error> {
-        let DirectoryMetadata { fs_index, .. } = self
-            .dir_metadatas
-            .get(date)
-            .cloned()
+        let dir = self
+            .dirs
+            .iter()
+            .find(|d| &d.date == date)
             .ok_or(Error::BadDate(*date))?;
-        let dir = self.dirs.get(fs_index).ok_or(Error::BadDate(*date))?;
 
         Ok(dir.images.clone())
     }

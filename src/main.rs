@@ -9,7 +9,7 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -79,8 +79,10 @@ enum NodeSyncState {
 #[derive(Debug, Default)]
 struct LocalDateState {
     has_announced_dir_images: bool,
-    image_locations: HashMap<String, PeerId>,
-    heard_peers: HashSet<PeerId>,
+    image_locations: HashMap<String, (PeerId, crate::filesystem::Image)>,
+    heard_hash_peers: HashSet<PeerId>,
+    heard_dir_peers: HashSet<PeerId>,
+    closed: bool,
 }
 
 #[derive(Debug)]
@@ -175,49 +177,51 @@ impl Node {
         } = message_request;
         tracing::debug!(%my_peer_id, ?message, "Processing sync message");
         match message {
-            SyncMessage::AnnounceDirectoryHash {
-                date,
-                directory_hash: announced_directory_hash,
-                ..
-            } => {
-                let parsed_date = NaiveDate::parse_from_str(&date, DATE_FORMAT_DIR)
-                    .map_err(|_| Error::InvalidDateFormat(date.clone()))?;
-                let local_date_state_ref = self.state.date_states.entry(parsed_date).or_default();
-
-                let my_dir_hash = self.fs.dir_state(&parsed_date)?;
-
-                if my_dir_hash.to_hex().to_string() == announced_directory_hash {
-                    local_date_state_ref.heard_peers.insert(from_peer_id);
-                    if local_date_state_ref.heard_peers.len() == DESIRED_PEERS {
-                        self.state.remaining_to_sync =
-                            self.state.remaining_to_sync.saturating_sub(1);
-                    }
-                    return Ok(None);
-                }
-
-                if local_date_state_ref.has_announced_dir_images {
-                    return Ok(None);
-                }
-
-                let my_images_for_this_date = self
-                    .fs
-                    .get_images_for_date(&parsed_date)
-                    .await?
-                    .into_iter()
-                    .map(|(hash, image)| {
-                        (
-                            image.created_at.format(DATE_FORMAT_IMG).to_string(),
-                            hash.to_hex().to_string(),
-                        )
-                    })
-                    .collect();
-                local_date_state_ref.has_announced_dir_images = true;
-                Ok(Some(SyncMessage::AnnounceDirectoryImages {
-                    _peer_id: my_peer_id,
-                    date,
-                    directory_images: my_images_for_this_date,
-                }))
-            }
+            // SyncMessage::AnnounceDirectoryHash {
+            //     date,
+            //     directory_hash: announced_directory_hash,
+            //     ..
+            // } => {
+            //     let parsed_date = NaiveDate::parse_from_str(&date, DATE_FORMAT_DIR)
+            //         .map_err(|_| Error::InvalidDateFormat(date.clone()))?;
+            //     let local_date_state_ref = self.state.date_states.entry(parsed_date).or_default();
+            //
+            //     let my_dir_hash = self.fs.dir_state(&parsed_date)?;
+            //
+            //     if my_dir_hash.to_hex().to_string() == announced_directory_hash
+            //         && !local_date_state_ref.closed
+            //     {
+            //         local_date_state_ref.heard_hash_peers.insert(from_peer_id);
+            //         if local_date_state_ref.heard_hash_peers.len() == DESIRED_PEERS {
+            //             self.state.remaining_to_sync -= 1;
+            //             local_date_state_ref.closed = true;
+            //         }
+            //         return Ok(None);
+            //     }
+            //
+            //     if local_date_state_ref.has_announced_dir_images {
+            //         return Ok(None);
+            //     }
+            //
+            //     let my_images_for_this_date = self
+            //         .fs
+            //         .get_images_for_date(&parsed_date)
+            //         .await?
+            //         .into_iter()
+            //         .map(|(hash, image)| {
+            //             (
+            //                 image.created_at.format(DATE_FORMAT_IMG).to_string(),
+            //                 hash.to_hex().to_string(),
+            //             )
+            //         })
+            //         .collect();
+            //     local_date_state_ref.has_announced_dir_images = true;
+            //     Ok(Some(SyncMessage::AnnounceDirectoryImages {
+            //         _peer_id: my_peer_id,
+            //         date,
+            //         directory_images: my_images_for_this_date,
+            //     }))
+            // }
             SyncMessage::AnnounceDirectoryImages {
                 date,
                 directory_images,
@@ -227,25 +231,43 @@ impl Node {
                     .map_err(|_| Error::InvalidDateFormat(date.clone()))?;
                 let local_date_state_ref = self.state.date_states.entry(parsed_date).or_default();
 
+                if local_date_state_ref.closed {
+                    return Ok(None);
+                }
+
                 let have_images = self
                     .fs
                     .get_images_for_date(&parsed_date)
                     .await?
                     .into_iter()
-                    .map(|(hash, _)| hash.to_hex().to_string())
+                    .map(|(hash, _image)| hash.to_hex().to_string())
                     .collect::<HashSet<String>>();
                 let provided_images = HashSet::<String>::from_iter(
-                    directory_images.into_iter().map(|(_, hash)| hash),
+                    directory_images.iter().map(|(_, hash)| hash.clone()),
                 );
 
-                for img_hash in have_images.difference(&provided_images) {
+                for img_hash in provided_images.difference(&have_images) {
+                    let image_created_at = NaiveDateTime::parse_from_str(
+                        &directory_images
+                            .iter()
+                            .find(|(_created_at, hash)| hash == img_hash)
+                            .unwrap()
+                            .0,
+                        DATE_FORMAT_IMG,
+                    )
+                    .unwrap();
                     local_date_state_ref
                         .image_locations
-                        .insert(img_hash.clone(), from_peer_id);
+                        .insert(img_hash.clone(), (from_peer_id, crate::filesystem::Image {
+                            created_at: image_created_at,
+                        }));
                 }
-                local_date_state_ref.heard_peers.insert(from_peer_id);
-                if local_date_state_ref.heard_peers.len() == DESIRED_PEERS {
-                    self.state.remaining_to_sync = self.state.remaining_to_sync.saturating_sub(1);
+
+                local_date_state_ref.heard_dir_peers.insert(from_peer_id);
+
+                if local_date_state_ref.heard_dir_peers.len() == DESIRED_PEERS {
+                    local_date_state_ref.closed = true;
+                    self.state.remaining_to_sync -= 1;
                 }
 
                 Ok(None)
@@ -255,6 +277,7 @@ impl Node {
                 self.state.peers.retain(|p| *p != from_peer_id);
                 Ok(None)
             }
+            _ => { Ok(None) }
         }
     }
 
@@ -266,25 +289,25 @@ impl Node {
 
                     let mut processing_date = self.config.sync_start_point;
                     let end_date = self.config.sync_end_point;
-                    while processing_date != end_date {
+                    while processing_date != (end_date.succ_opt().unwrap()) {
                         tracing::trace!(%processing_date, "Processing sync for date");
                         let processing_date_pretty = processing_date.format(DATE_FORMAT_DIR).to_string();
-                        let my_hash = self
-                            .fs
-                            .dir_state(&processing_date)?;
+                        // let my_hash = self
+                        //     .fs
+                        //     .dir_state(&processing_date)?;
 
+                        let images = self.fs.get_images_for_date(&processing_date).await?;
                         self.gossipsub_tx
-                            .send(SyncMessage::AnnounceDirectoryHash {
+                            .send(SyncMessage::AnnounceDirectoryImages {
                                 _peer_id: my_peer_id,
                                 date: processing_date_pretty,
-                                directory_hash: my_hash.to_hex().to_string()
+                                // directory_hash: my_hash.to_hex().to_string()
+                                directory_images: images.iter().cloned().map(|(h, i)| (i.created_at.format(DATE_FORMAT_IMG).to_string(), h.to_hex().to_string())).collect(),
                             })
                             .await
                             .expect("channel closed");
                         processing_date = processing_date.succ_opt().unwrap();
                     }
-
-
                 },
                 inbound_msg = self.inbound_rx.recv() => {
                         tracing::debug!(?inbound_msg, "Processing inbound message");
@@ -301,16 +324,24 @@ impl Node {
 
                         // tracing::info!(?self.state.sync, ?self.state.peers, ?self.state.remaining_to_sync, "LAST STATE");
                         if self.state.remaining_to_sync == 0 && matches!(self.state.sync, NodeSyncState::SyncProgress) {
+                            self.state.sync = NodeSyncState::SyncDone;
                             for (date, state) in self.state.date_states.iter() {
+                                for (_img_hash, (_peer, missing_image)) in state.image_locations.iter() {
+                                    let _ = self.fs.add_image(*date, missing_image.clone());
+                                }
                                 tracing::info!(
                                     processed_date = %date,
-                                    peers_responded = ?state.heard_peers,
-                                    dir_images_announced = %state.has_announced_dir_images,
+                                    // peers_responded = ?state.heard_peers,
+                                    // dir_images_announced = %state.has_announced_dir_images,
                                     missing_image_locations = ?state.image_locations,
+                                    ?state.heard_hash_peers,
+                                    ?state.heard_dir_peers,
                                     "Stats for the date"
                                 );
                             }
-                            self.state.sync = NodeSyncState::SyncDone;
+                            self.fs.update_root_hash();
+                            // dbg!(&self.fs.dirs);
+                            tracing::info!(root_hash = %self.fs.root_hash.unwrap().to_hex(), "Resulting root hash");
                             tracing::info!("saying bye");
 
                             self.gossipsub_tx
@@ -322,7 +353,7 @@ impl Node {
                         }
                         if self.state.peers.len() == 0 && matches!(self.state.sync, NodeSyncState::SyncDone) {
                             tracing::info!("finished sync and processed all peer messages");
-                            break Ok(());
+                            // break Ok(());
                         }
                 }
             }
